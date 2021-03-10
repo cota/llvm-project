@@ -525,10 +525,74 @@ ExpApproximation::matchAndRewrite(math::ExpOp op,
   return success();
 }
 
+namespace {
+struct RsqrtApproximation : public OpRewritePattern<math::RsqrtOp> {
+  using OpRewritePattern::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(math::RsqrtOp op,
+                                PatternRewriter &rewriter) const final;
+};
+} // namespace
+
+LogicalResult
+RsqrtApproximation::matchAndRewrite(math::RsqrtOp op,
+                                    PatternRewriter &rewriter) const {
+  auto width = vectorWidth(op.operand().getType(), isF32);
+  if (!width.hasValue())
+    return rewriter.notifyMatchFailure(op, "unsupported operand type");
+
+  ImplicitLocOpBuilder builder(op->getLoc(), rewriter);
+  auto bcast = [&](Value value) -> Value {
+    return broadcast(builder, value, *width);
+  };
+
+  Value cstPosInf = bcast(f32FromBits(builder, 0x7f800000u));
+  Value cstOnePointFive = bcast(f32Cst(builder, 1.5f));
+  Value cstNegHalf = bcast(f32Cst(builder, -0.5f));
+  Value cstMinNormPos = bcast(f32FromBits(builder, 0x00800000u));
+
+  Value neg_half = builder.create<MulFOp>(op.operand(), cstNegHalf);
+
+  // Select only the inverse sqrt of positive normals (denormals ar
+  // flushed to zero).
+  Value lt_min_mask = builder.create<CmpFOp>(CmpFPredicate::OLT, op.operand(), cstMinNormPos);
+  Value inf_mask = builder.create<CmpFOp>(CmpFPredicate::OEQ, op.operand(), cstPosInf);
+  Value not_normal_finite_mask = builder.create<LLVM::OrOp>(lt_min_mask, inf_mask);
+
+  // Compute an approximate result using the rsqrt intrinsic.
+  Value y_approx = builder.create<math::RsqrtOp>(op.operand());
+#if 0
+XXX: what should I call here to avoid recursing into myself?
+LLVM::RsqrtOp doesn't work:
+PolynomialApproximation.cpp:563:41: error: no member named 'RsqrtOp' in namespace 'mlir::LLVM'
+  Value y_approx = builder.create<LLVM::RsqrtOp>(op.operand());
+                                  ~~~~~~^
+#endif
+
+  // Do a single step of Newton-Raphson iteration to improve the approximation.
+  // This uses the formula y_{n+1} = y_n * (1.5 - y_n * (0.5 * x) * y_n).
+  // It is essential to evaluate the inner term like this because forming
+  // y_n^2 may over- or underflow.
+  Value inner = builder.create<MulFOp>(neg_half, y_approx);
+  Value fma = builder.create<FmaFOp>(y_approx, inner, cstOnePointFive);
+  Value y_newton = builder.create<MulFOp>(y_approx, fma);
+
+  // Select the result of the Newton-Raphson step for positive normal arguments.
+  // For other arguments, choose the output of the intrinsic. This will
+  // return rsqrt(+inf) = 0, rsqrt(x) = NaN if x < 0, and rsqrt(x) = +inf if
+  // x is zero or a positive denormalized float (equivalent to flushing positive
+  // denormalized inputs to zero).
+  Value res =
+      builder.create<SelectOp>(not_normal_finite_mask, y_approx, y_newton);
+
+  rewriter.replaceOp(op, res);
+  return success();
+}
+
 //----------------------------------------------------------------------------//
 
 void mlir::populateMathPolynomialApproximationPatterns(
     OwningRewritePatternList &patterns, MLIRContext *ctx) {
   patterns.insert<TanhApproximation, LogApproximation, Log2Approximation,
-                  ExpApproximation>(ctx);
+      ExpApproximation, RsqrtApproximation>(ctx);
 }
